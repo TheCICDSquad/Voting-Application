@@ -1,0 +1,35 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# 1 replica per service - this environment runs on a single SPOT node
+# (see terraform/environments/dev.tfvars), so there's rarely capacity for
+# more than one pod per service anyway.
+replicas:
+  - name: frontend
+    count: 1
+  - name: catalogue
+    count: 1
+  - name: voting
+    count: 1
+  - name: recommendation
+    count: 1
+
+# The application-deploy.yaml pipeline overwrites these tags on every
+# deploy to this environment via:
+#   kustomize edit set image craftista-<service>=<ecr-repo>:<git-sha>
+images:
+  - name: craftista-frontend
+    newName: REPLACE_WITH_ECR_REPO_URL/craftista-frontend
+    newTag: latest
+  - name: craftista-catalogue
+    newName: REPLACE_WITH_ECR_REPO_URL/craftista-catalogue
+    newTag: latest
+  - name: craftista-voting
+    newName: REPLACE_WITH_ECR_REPO_URL/craftista-voting
+    newTag: latest
+  - name: craftista-recommendation
+    newName: REPLACE_WITH_ECR_REPO_URL/craftista-recommendation
+    newTag: latest

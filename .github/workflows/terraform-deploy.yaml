@@ -1,0 +1,138 @@
+# Pipeline 1 of 2 (see docs/devops/02-cicd-pipeline.md): infrastructure only.
+# Scans every change to terraform/** with Checkov + Trivy, plans all three
+# environments (dev, nonprod, prod - one shared main.tf/modules, three
+# independent state files, see terraform/main.tf) on every push/PR for
+# visibility, and only ever applies/destroys a SINGLE environment, and only
+# when someone explicitly runs this workflow with workflow_dispatch - on a
+# personal, cost-sensitive project, infra changes should never land
+# unattended.
+#
+# Note: "dev" must be applied at least once before "nonprod"/"prod" - it's
+# the one that creates the shared ECR repos + GitHub OIDC role that the
+# other two environments look up (see terraform/main.tf's
+# is_primary_environment).
+name: terraform deployment
+
+on:
+  push:
+    branches: [main]
+    paths: ["terraform/**", ".github/workflows/terraform-deploy.yaml"]
+  pull_request:
+    branches: [main]
+    paths: ["terraform/**", ".github/workflows/terraform-deploy.yaml"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Which environment's state to act on"
+        type: choice
+        options: [dev, nonprod, prod]
+        required: true
+      action:
+        description: "plan = preview only, apply = create/update, destroy = tear down (use to stop paying for an environment you're done with)"
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write # required to upload Checkov/Trivy SARIF to the Security tab
+
+defaults:
+  run:
+    working-directory: terraform
+
+jobs:
+  # --- Static analysis: runs once, against the whole terraform/ tree,
+  # regardless of which environment a later job touches. -------------------
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive
+
+      - name: Checkov (IaC misconfiguration scan)
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform
+          framework: terraform
+          soft_fail: true # report everything, don't block on Checkov's (often noisy) findings
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+
+      - name: Trivy IaC scan (misconfigurations + exposed secrets)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          scan-ref: terraform
+          severity: CRITICAL,HIGH
+          exit-code: "1" # unlike Checkov, this one blocks the pipeline
+          format: sarif
+          output: trivy-results.sarif
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: terraform/trivy-results.sarif
+          category: trivy-iac
+
+  # --- Plan every environment on every push/PR, purely for review - never
+  # applies anything. --------------------------------------------------
+  plan:
+    needs: scan
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, nonprod, prod]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - run: terraform init -backend-config=backend-configs/${{ matrix.environment }}.hcl
+
+      - name: terraform plan (${{ matrix.environment }})
+        run: |
+          terraform plan -no-color \
+            -var-file="environments/${{ matrix.environment }}.tfvars" \
+            -var "db_password=${{ secrets.CATALOGUE_DB_PASSWORD }}"
+
+  # --- Apply/destroy exactly one environment, only on an explicit manual
+  # run. -------------------------------------------------------------------
+  apply:
+    needs: scan
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action != 'plan'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }} # GitHub Environment protection rules gate nonprod/prod approval
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - run: terraform init -backend-config=backend-configs/${{ github.event.inputs.environment }}.hcl
+
+      - name: terraform ${{ github.event.inputs.action }} (${{ github.event.inputs.environment }})
+        run: |
+          terraform ${{ github.event.inputs.action }} -auto-approve \
+            -var-file="environments/${{ github.event.inputs.environment }}.tfvars" \
+            -var "db_password=${{ secrets.CATALOGUE_DB_PASSWORD }}"

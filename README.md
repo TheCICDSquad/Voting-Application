@@ -6,6 +6,9 @@ We, at [School of Devops](https://schoolofdevops.com) take pride to introduce yo
 ## Demo Repository (If you just want to launch the app in 5 mins and play with it)
 This project repo  is for builders who want to learn Devops by building projects from scratch. If you are looking for just launching this app in less than 5 minutes and playing around with it, head over to [Craftista Demo](https://github.com/craftista/craftista-demo) instead. 
 
+## Deploying to Production (Git, GitHub Actions, EKS, Terraform)
+Docker, Kubernetes/EKS manifests, GitHub Actions pipelines and Terraform infrastructure code for deploying all four services are included in this repo. Start at [docs/devops/README.md](docs/devops/README.md).
+
 
 ## What is Craftista: Celebrating the Art of Origami 
 

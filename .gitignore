@@ -1,0 +1,34 @@
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Node (frontend)
+frontend/node_modules/
+frontend/npm-debug.log
+
+# Python (catalogue)
+catalogue/__pycache__/
+catalogue/*.pyc
+catalogue/.venv/
+catalogue/venv/
+
+# Java (voting)
+voting/target/
+voting/.mvn/wrapper/maven-wrapper.jar
+
+# Go (recommendation)
+recommendation/recommendation
+
+# Terraform (root stack and terraform/global both apply here)
+terraform/**/.terraform/
+terraform/**/.terraform.lock.hcl
+terraform/**/*.tfstate
+terraform/**/*.tfstate.backup
+terraform/**/crash.log
+# environments/*.tfvars and backend-configs/*.hcl are committed on purpose
+# (no secrets in them - db_password is passed separately, never in a file)
+
+# Secrets
+*.env
+.env.*

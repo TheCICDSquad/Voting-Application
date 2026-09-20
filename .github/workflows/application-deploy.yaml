@@ -1,0 +1,246 @@
+# Pipeline 2 of 2 (see docs/devops/02-cicd-pipeline.md): all four services,
+# one workflow. Only the services whose folder actually changed are
+# tested/built (dorny/paths-filter + a matrix), each image is scanned with
+# Aqua Trivy before it's pushed, and a push to main auto-deploys to `dev`.
+# Promoting the exact same image to `nonprod`/`prod` is a separate,
+# manually-triggered job - it never rebuilds, just redeploys what already
+# passed dev.
+name: application deployment
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - "catalogue/**"
+      - "voting/**"
+      - "recommendation/**"
+      - "k8s/**"
+      - ".github/workflows/application-deploy.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - "catalogue/**"
+      - "voting/**"
+      - "recommendation/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Promote the current main branch's already-built images to this environment (does not rebuild)"
+        type: choice
+        options: [nonprod, prod]
+        required: true
+
+permissions:
+  id-token: write
+  contents: write
+  security-events: write
+
+jobs:
+  # --- Which of the 4 services actually changed? ---------------------------
+  detect-changes:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.filter.outputs.changes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend: ["frontend/**"]
+            catalogue: ["catalogue/**"]
+            voting: ["voting/**"]
+            recommendation: ["recommendation/**"]
+
+  # --- Test only the services that changed, with each one's own toolchain. -
+  test:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - if: matrix.service == 'frontend'
+        uses: actions/setup-node@v4
+        with: { node-version: "18" }
+      - if: matrix.service == 'frontend'
+        working-directory: frontend
+        run: npm install && npm test
+
+      - if: matrix.service == 'catalogue'
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - if: matrix.service == 'catalogue'
+        working-directory: catalogue
+        run: pip install -r requirements.txt && python -m unittest test_app.py
+
+      - if: matrix.service == 'voting'
+        uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17", cache: maven }
+      - if: matrix.service == 'voting'
+        working-directory: voting
+        run: mvn -B test
+
+      - if: matrix.service == 'recommendation'
+        uses: actions/setup-go@v5
+        with: { go-version: "1.20" }
+      - if: matrix.service == 'recommendation'
+        working-directory: recommendation
+        run: go build ./... && go test ./...
+
+  # --- Build, Aqua Trivy image scan, push, deploy to dev. Main only. -------
+  build-scan-push-deploy:
+    needs: [detect-changes, test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: dev
+    strategy:
+      # max-parallel: 1 - every matrix entry commits and pushes the same
+      # k8s/overlays/dev/kustomization.yaml at the end (the image tag
+      # bump); running services concurrently would race on that push (and
+      # pile concurrent image builds onto dev's single small SPOT node).
+      max-parallel: 1
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/craftista-${{ matrix.service }}:${{ github.sha }}"
+          docker build -t "$IMAGE" ./${{ matrix.service }}
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # Aqua Trivy scans the image straight out of the local Docker daemon -
+      # nothing is pushed to ECR until this step passes.
+      - name: Aqua Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: ${{ steps.image.outputs.image }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          format: sarif
+          output: trivy-image-results.sarif
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-image-results.sarif
+          category: trivy-image-${{ matrix.service }}
+
+      - name: Push image
+        run: docker push ${{ steps.image.outputs.image }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name craftista-dev-eks --region ${{ vars.AWS_REGION }}
+
+      - uses: imranismail/setup-kustomize@v2
+
+      - name: Set image tag and apply
+        working-directory: k8s/overlays/dev
+        run: |
+          kustomize edit set image craftista-${{ matrix.service }}=${{ steps.image.outputs.image }}
+          kubectl apply -k .
+
+      # k8s/base/catalogue.yaml ships with a placeholder Secret; overwrite it
+      # with the real per-environment RDS endpoint/password (set as GitHub
+      # Environment variables/secrets on the "dev" Environment) on every
+      # catalogue deploy, then restart so pods pick it up.
+      - name: Sync real catalogue DB secret
+        if: matrix.service == 'catalogue'
+        run: |
+          kubectl -n craftista create secret generic catalogue-config \
+            --from-literal=config.json="$(jq -n \
+              --arg host "${{ vars.CATALOGUE_DB_HOST }}" \
+              --arg pass "${{ secrets.CATALOGUE_DB_PASSWORD }}" \
+              '{app_version:"1.0.0",data_source:"db",db_host:$host,db_name:"catalogue",db_user:"devops",db_password:$pass}')" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n craftista rollout restart deployment/catalogue
+
+      - name: Wait for rollout
+        run: kubectl -n craftista rollout status deployment/${{ matrix.service }} --timeout=180s
+
+      - name: Persist image tag back to the dev overlay
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/overlays/dev/kustomization.yaml
+          git diff --cached --quiet || git commit -m "deploy(dev/${{ matrix.service }}): ${{ github.sha }} [skip ci]"
+          git push
+
+  # --- Promote: redeploy the already-scanned, already-pushed :sha image to
+  # nonprod or prod. No build, no re-scan - manual trigger only. -----------
+  promote:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    strategy:
+      max-parallel: 1 # same reason as build-scan-push-deploy - one shared kustomization.yaml to commit/push
+      matrix:
+        service: [frontend, catalogue, voting, recommendation]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name craftista-${{ github.event.inputs.environment }}-eks --region ${{ vars.AWS_REGION }}
+
+      - uses: imranismail/setup-kustomize@v2
+
+      - name: Set image tag and apply
+        working-directory: k8s/overlays/${{ github.event.inputs.environment }}
+        run: |
+          IMAGE="${{ steps.ecr-login.outputs.registry }}/craftista-${{ matrix.service }}:${{ github.sha }}"
+          kustomize edit set image craftista-${{ matrix.service }}=$IMAGE
+          kubectl apply -k .
+
+      - name: Sync real catalogue DB secret
+        if: matrix.service == 'catalogue'
+        run: |
+          kubectl -n craftista create secret generic catalogue-config \
+            --from-literal=config.json="$(jq -n \
+              --arg host "${{ vars.CATALOGUE_DB_HOST }}" \
+              --arg pass "${{ secrets.CATALOGUE_DB_PASSWORD }}" \
+              '{app_version:"1.0.0",data_source:"db",db_host:$host,db_name:"catalogue",db_user:"devops",db_password:$pass}')" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n craftista rollout restart deployment/catalogue
+
+      - name: Wait for rollout
+        run: kubectl -n craftista rollout status deployment/${{ matrix.service }} --timeout=180s
+
+      - name: Persist image tag back to the overlay
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/overlays/${{ github.event.inputs.environment }}/kustomization.yaml
+          git diff --cached --quiet || git commit -m "deploy(${{ github.event.inputs.environment }}/${{ matrix.service }}): ${{ github.sha }} [skip ci]"
+          git push

@@ -1,0 +1,85 @@
+# NOTE: db_password below is a placeholder. Real environments must NOT commit
+# this file with a live secret populated. CI/CD injects the real value from
+# the GitHub Actions secret CATALOGUE_DB_PASSWORD (sourced from the RDS
+# Terraform output) at deploy time - see docs/devops/02-cicd-pipeline.md and
+# docs/devops/03-eks-deployment.md. Consider External Secrets Operator or
+# Sealed Secrets for a production-grade setup instead of a plain Secret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: catalogue-config
+  namespace: craftista
+type: Opaque
+stringData:
+  config.json: |
+    {
+      "app_version": "1.0.0",
+      "data_source": "db",
+      "db_host": "REPLACE_WITH_RDS_ENDPOINT",
+      "db_name": "catalogue",
+      "db_user": "devops",
+      "db_password": "REPLACE_WITH_RDS_PASSWORD"
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalogue
+  namespace: craftista
+  labels:
+    app: catalogue
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: catalogue
+  template:
+    metadata:
+      labels:
+        app: catalogue
+    spec:
+      containers:
+        - name: catalogue
+          image: craftista-catalogue:latest
+          ports:
+            - containerPort: 5000
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.json
+              subPath: config.json
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /api/products
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/products
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: config
+          secret:
+            secretName: catalogue-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalogue
+  namespace: craftista
+spec:
+  selector:
+    app: catalogue
+  ports:
+    - port: 5000
+      targetPort: 5000
+  type: ClusterIP

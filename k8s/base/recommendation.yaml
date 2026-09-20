@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: recommendation-config
+  namespace: craftista
+data:
+  config.json: |
+    {
+      "version": "1.0.0"
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recommendation
+  namespace: craftista
+  labels:
+    app: recommendation
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: recommendation
+  template:
+    metadata:
+      labels:
+        app: recommendation
+    spec:
+      containers:
+        - name: recommendation
+          image: craftista-recommendation:latest
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.json
+              subPath: config.json
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 64Mi
+          readinessProbe:
+            httpGet:
+              path: /api/recommendation-status
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/recommendation-status
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      volumes:
+        - name: config
+          configMap:
+            name: recommendation-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recommendation
+  namespace: craftista
+spec:
+  selector:
+    app: recommendation
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP
